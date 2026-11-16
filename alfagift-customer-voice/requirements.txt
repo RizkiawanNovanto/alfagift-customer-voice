@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers==5.16.1
+streamlit==1.67.0
+pandas==3.0.5
+numpy==2.5.3
+plotly==7.1.0
