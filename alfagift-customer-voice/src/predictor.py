@@ -3,13 +3,9 @@
 Model dimuat dari salah satu lokasi berikut, sesuai urutan:
 1. Variabel lingkungan ALFAGIFT_MODEL_DIR (path folder lokal ATAU id model di Hugging Face Hub).
 2. Folder lokal models/indobert (atau nama lain pada MODEL_DIR_NAMES) yang berisi config.json.
+3. Hugging Face Hub: Rizkiawan/alfagift-indobert (subfolder indobert), diunduh otomatis.
 
-Jika tidak ada keduanya, aplikasi berhenti dengan pesan error yang jelas.
 Tidak ada fallback ke SVM atau aturan kata: prediksi selalu dari IndoBERT.
-
-Cara menyimpan IndoBERT dari notebook:
-    trainer.save_model("models/indobert")
-    tokenizer.save_pretrained("models/indobert")
 Urutan kelas harus 0 = Negatif, 1 = Netral, 2 = Positif (atau diisi pada id2label di config.json).
 """
 import os
@@ -19,6 +15,7 @@ from pathlib import Path
 LABELS = ["Negatif", "Netral", "Positif"]
 MODEL_DIR_NAMES = ["indobert", "indobert_best", "indobert-sentiment", "indobert_sentiment"]
 MAX_LENGTH = 128
+HF_REPO = "Rizkiawan/alfagift-indobert"
 
 SLANG = {"gk": "tidak", "gx": "tidak", "gak": "tidak", "nggak": "tidak", "ngga": "tidak", "yg": "yang", "dgn": "dengan",
          "bgt": "banget", "aja": "saja", "udah": "sudah", "blm": "belum", "krn": "karena"}
@@ -56,25 +53,85 @@ class MissingModelError(FileNotFoundError):
     """IndoBERT tidak ditemukan. Pesannya ditampilkan langsung ke pengguna aplikasi."""
 
 
+# ---------------------------------------------------------------- penyiapan folder model
+def _is_valid_dir(p):
+    """Folder model valid: ada config, bobot asli (bukan pointer LFS), dan tokenizer.json."""
+    p = Path(p)
+    w = p / "model.safetensors"
+    return (
+        p.is_dir()
+        and (p / "config.json").exists()
+        and (p / "tokenizer.json").exists()
+        and w.exists()
+        and w.stat().st_size > 10_000_000
+    )
+
+
+def _find_valid_subdir(root):
+    root = Path(root)
+    if _is_valid_dir(root):
+        return root
+    for cfg in root.rglob("config.json"):
+        if _is_valid_dir(cfg.parent):
+            return cfg.parent
+    return None
+
+
+def _download_from_hub(repo_id):
+    from huggingface_hub import snapshot_download
+    root = snapshot_download(repo_id)
+    found = _find_valid_subdir(root)
+    if found is None:
+        raise MissingModelError(
+            f"Repo Hugging Face `{repo_id}` sudah diunduh, tetapi tidak berisi model lengkap "
+            "(config.json, tokenizer.json, model.safetensors).")
+    return found
+
+
+def _prepare_dir(path):
+    """Kembalikan Path folder model yang siap dipakai; unduh dari Hugging Face bila perlu."""
+    p = Path(str(path))
+    if p.exists():
+        found = _find_valid_subdir(p)
+        if found is not None:
+            return found
+        # folder lokal ada tetapi tidak lengkap (mis. pointer LFS): pakai Hugging Face
+        return _download_from_hub(HF_REPO)
+    # bukan folder lokal: anggap sebagai id repo Hugging Face
+    try:
+        return _download_from_hub(str(path))
+    except MissingModelError:
+        raise
+    except Exception:
+        return _download_from_hub(HF_REPO)
+
+
 class BertPredictor:
     kind = "bert"
     note = "Prediksi memakai model IndoBERT hasil fine-tuning."
 
     def __init__(self, path):
         import torch
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from transformers import AutoModelForSequenceClassification, PreTrainedTokenizerFast
         self.torch = torch
-        self.tok = AutoTokenizer.from_pretrained(path)
-        self.model = AutoModelForSequenceClassification.from_pretrained(path)
+        model_dir = _prepare_dir(path)
+        self.tok = PreTrainedTokenizerFast(
+            tokenizer_file=str(model_dir / "tokenizer.json"),
+            cls_token="[CLS]", sep_token="[SEP]", pad_token="[PAD]",
+            unk_token="[UNK]", mask_token="[MASK]",
+            model_max_length=512,
+        )
+        self.model = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
         self.model.eval()
         id2 = getattr(self.model.config, "id2label", {}) or {}
         n = self.model.config.num_labels
         self.order = [_norm_label(id2.get(i, f"LABEL_{i}"), i) for i in range(n)]
         self.name = "IndoBERT (fine-tuned)"
-        self.source = str(path)
+        self.source = str(model_dir)
 
     def predict(self, text):
         enc = self.tok(clean_text(text), truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
+        enc.pop("token_type_ids", None) if "token_type_ids" not in self.model.forward.__code__.co_varnames else None
         with self.torch.no_grad():
             logits = self.model(**enc).logits[0]
         p = self.torch.softmax(logits, dim=-1).cpu().numpy()
@@ -113,14 +170,18 @@ def find_model_dir(root):
 
 
 def load_predictor(root):
-    """Muat IndoBERT. Melempar MissingModelError bila model belum tersedia (tidak ada fallback)."""
+    """Muat IndoBERT. Bila tidak ada lokasi lokal/env, otomatis unduh dari Hugging Face."""
     location = find_model_dir(root)
     if location is None:
+        location = HF_REPO
+    try:
+        return BertPredictor(location)
+    except MissingModelError:
+        raise
+    except OSError as e:
         raise MissingModelError(
-            "Model IndoBERT belum ditemukan. Pastikan file `model.safetensors` sudah ada di folder "
-            "`models/indobert/` (bersama config.json dan tokenizer), atau atur variabel lingkungan "
-            "`ALFAGIFT_MODEL_DIR` ke folder lokal atau ID model di Hugging Face. Panduan ada di README.md.")
-    return BertPredictor(location)
+            f"Model IndoBERT gagal dimuat dari `{location}`: {e}. "
+            "Pastikan koneksi ke Hugging Face tersedia atau atur `ALFAGIFT_MODEL_DIR`.") from e
 
 
 # ---------------------------------------------------------------- penilaian bintang vs teks
